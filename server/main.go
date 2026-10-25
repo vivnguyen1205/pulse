@@ -54,7 +54,7 @@ func main() {
 	defer pool.Close()
  
 	if err := pool.Ping(ctx); err != nil {
-		log.Fatalf("cannot reach database (is docker running?): %v", err)
+		log.Fatalf("cannot reach database (check DATABASE_URL): %v", err)
 	}
  
 	// Agents must send this key to write metrics. Refuse to start without one
