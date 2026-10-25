@@ -11,11 +11,25 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
  
+// Metric is one data point sent by an agent.
 type Metric struct {
 	Host      string  `json:"host"`
 	Name      string  `json:"name"`
 	Value     float64 `json:"value"`
 	Timestamp int64   `json:"timestamp"`
+}
+ 
+// Point is one (time, value) pair returned by the query API.
+type Point struct {
+	Timestamp int64   `json:"timestamp"`
+	Value     float64 `json:"value"`
+}
+ 
+// QueryResponse is what GET /metrics returns.
+type QueryResponse struct {
+	Host   string  `json:"host"`
+	Name   string  `json:"name"`
+	Points []Point `json:"points"`
 }
  
 type Server struct {
@@ -45,11 +59,13 @@ func main() {
  
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /metrics", s.handleIngest)
+	mux.HandleFunc("GET /metrics", s.handleQuery)
  
 	log.Println("server listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }
  
+// handleIngest receives metrics from agents and stores them.
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	var metrics []Metric
 	if err := json.NewDecoder(r.Body).Decode(&metrics); err != nil {
@@ -78,3 +94,59 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
  
+// handleQuery returns stored metrics for one host and metric name over a time window.
+// Example: GET /metrics?host=my-laptop&name=cpu.percent&since=1h
+func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	// Allow the dashboard (running on a different port/domain) to call this endpoint.
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+ 
+	q := r.URL.Query()
+	host := q.Get("host")
+	name := q.Get("name")
+	if host == "" || name == "" {
+		http.Error(w, "host and name query parameters are required", http.StatusBadRequest)
+		return
+	}
+ 
+	since := time.Hour
+	if v := q.Get("since"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			http.Error(w, "invalid since (use e.g. 15m, 1h, 24h)", http.StatusBadRequest)
+			return
+		}
+		since = d
+	}
+ 
+	rows, err := s.db.Query(r.Context(),
+		`SELECT ts, value FROM metrics
+		 WHERE host = $1 AND name = $2 AND ts >= $3
+		 ORDER BY ts`,
+		host, name, time.Now().Add(-since))
+	if err != nil {
+		log.Printf("query failed: %v", err)
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+ 
+	points := []Point{} // start empty (not nil) so JSON is [] instead of null
+	for rows.Next() {
+		var ts time.Time
+		var value float64
+		if err := rows.Scan(&ts, &value); err != nil {
+			log.Printf("scan failed: %v", err)
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+		points = append(points, Point{Timestamp: ts.Unix(), Value: value})
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("rows error: %v", err)
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+ 
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(QueryResponse{Host: host, Name: name, Points: points})
+}
