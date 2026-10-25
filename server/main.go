@@ -2,6 +2,7 @@ package main
  
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -33,7 +34,8 @@ type QueryResponse struct {
 }
  
 type Server struct {
-	db *pgxpool.Pool
+	db     *pgxpool.Pool
+	apiKey string
 }
  
 func main() {
@@ -55,14 +57,39 @@ func main() {
 		log.Fatalf("cannot reach database (is docker running?): %v", err)
 	}
  
-	s := &Server{db: pool}
+	// Agents must send this key to write metrics. Refuse to start without one
+	// so the server is never accidentally deployed unlocked.
+	apiKey := os.Getenv("PULSE_API_KEY")
+	if apiKey == "" {
+		log.Fatal("PULSE_API_KEY is not set")
+	}
+ 
+	s := &Server{db: pool, apiKey: apiKey}
  
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /metrics", s.handleIngest)
+	mux.HandleFunc("POST /metrics", s.requireKey(s.handleIngest))
 	mux.HandleFunc("GET /metrics", s.handleQuery)
  
-	log.Println("server listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	// Hosts like Render pick the port and pass it in PORT.
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	log.Printf("server listening on :%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, mux))
+}
+ 
+// requireKey rejects requests that don't carry "Authorization: Bearer <PULSE_API_KEY>".
+func (s *Server) requireKey(next http.HandlerFunc) http.HandlerFunc {
+	want := []byte("Bearer " + s.apiKey)
+	return func(w http.ResponseWriter, r *http.Request) {
+		got := []byte(r.Header.Get("Authorization"))
+		if subtle.ConstantTimeCompare(got, want) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
  
 // handleIngest receives metrics from agents and stores them.

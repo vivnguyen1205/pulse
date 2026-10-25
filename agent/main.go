@@ -33,6 +33,10 @@ func main() {
 	if serverURL == "" {
 		serverURL = "http://localhost:8080"
 	}
+	apiKey := os.Getenv("PULSE_API_KEY")
+	if apiKey == "" {
+		log.Fatal("PULSE_API_KEY is not set")
+	}
 	log.Printf("agent started on %s, sending to %s", host, serverURL)
  
 	ticker := time.NewTicker(5 * time.Second)
@@ -42,7 +46,7 @@ func main() {
 		metrics, err := collect(host)
 		if err != nil {
 			log.Printf("collect failed: %v", err)
-		} else if err := send(serverURL, metrics); err != nil {
+		} else if err := send(serverURL, apiKey, metrics); err != nil {
 			log.Printf("send failed: %v", err)
 		} else {
 			log.Printf("sent %d metrics", len(metrics))
@@ -52,13 +56,20 @@ func main() {
 }
  
 // send converts metrics to JSON and POSTs them to the server.
-func send(serverURL string, metrics []Metric) error {
+func send(serverURL, apiKey string, metrics []Metric) error {
 	body, err := json.Marshal(metrics)
 	if err != nil {
 		return fmt.Errorf("encoding JSON: %w", err)
 	}
  
-	resp, err := client.Post(serverURL+"/metrics", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, serverURL+"/metrics", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+ 
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("posting to server: %w", err)
 	}
