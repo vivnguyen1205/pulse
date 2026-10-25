@@ -1,47 +1,75 @@
 package main
-
+ 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"time"
-
+ 
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/mem"
 )
-
-// Metric is one measurement: "on this host, at this time, this thing had this value."
+ 
 type Metric struct {
-	Host      string
-	Name      string
-	Value     float64
-	Timestamp int64
+	Host      string  `json:"host"`
+	Name      string  `json:"name"`
+	Value     float64 `json:"value"`
+	Timestamp int64   `json:"timestamp"`
 }
-
+ 
+// One shared HTTP client, with a timeout so a hung server can't freeze the agent.
+var client = &http.Client{Timeout: 5 * time.Second}
+ 
 func main() {
 	host, err := os.Hostname()
 	if err != nil {
 		log.Fatalf("could not get hostname: %v", err)
 	}
-	fmt.Printf("Agent started on %s\n", host)
-
+ 
+	serverURL := os.Getenv("PULSE_SERVER")
+	if serverURL == "" {
+		serverURL = "http://localhost:8080"
+	}
+	log.Printf("agent started on %s, sending to %s", host, serverURL)
+ 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-
+ 
 	for {
 		metrics, err := collect(host)
 		if err != nil {
 			log.Printf("collect failed: %v", err)
+		} else if err := send(serverURL, metrics); err != nil {
+			log.Printf("send failed: %v", err)
 		} else {
-			for _, m := range metrics {
-				fmt.Printf("%d  %-10s %-12s %6.1f\n", m.Timestamp, m.Host, m.Name, m.Value)
-			}
-			fmt.Println("---")
+			log.Printf("sent %d metrics", len(metrics))
 		}
 		<-ticker.C
 	}
 }
-
+ 
+// send converts metrics to JSON and POSTs them to the server.
+func send(serverURL string, metrics []Metric) error {
+	body, err := json.Marshal(metrics)
+	if err != nil {
+		return fmt.Errorf("encoding JSON: %w", err)
+	}
+ 
+	resp, err := client.Post(serverURL+"/metrics", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("posting to server: %w", err)
+	}
+	defer resp.Body.Close()
+ 
+	if resp.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("server returned %s", resp.Status)
+	}
+	return nil
+}
+ 
 // collect takes one snapshot of the machine's CPU and memory usage.
 func collect(host string) ([]Metric, error) {
 	cpuPercents, err := cpu.Percent(time.Second, false)
@@ -51,15 +79,16 @@ func collect(host string) ([]Metric, error) {
 	if len(cpuPercents) == 0 {
 		return nil, fmt.Errorf("no CPU data returned")
 	}
-
+ 
 	vm, err := mem.VirtualMemory()
 	if err != nil {
 		return nil, fmt.Errorf("reading memory: %w", err)
 	}
-
+ 
 	now := time.Now().Unix()
 	return []Metric{
 		{Host: host, Name: "cpu.percent", Value: cpuPercents[0], Timestamp: now},
 		{Host: host, Name: "mem.percent", Value: vm.UsedPercent, Timestamp: now},
 	}, nil
 }
+ 
