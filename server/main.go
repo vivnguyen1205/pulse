@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
  
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
  
@@ -34,14 +35,19 @@ type QueryResponse struct {
 }
  
 type Server struct {
-	db     *pgxpool.Pool
-	apiKey string
+	db            *pgxpool.Pool
+	apiKey        string // required on POST /metrics when set
+	allowedOrigin string // which website may call GET /metrics from a browser
 }
  
 func main() {
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = "postgres://pulse:pulse@localhost:5432/pulse"
+	dbURL := getenv("DATABASE_URL", "postgres://pulse:pulse@localhost:5432/pulse")
+	port := getenv("PORT", "8080") // hosting platforms set PORT for you
+	apiKey := os.Getenv("PULSE_API_KEY")
+	allowedOrigin := getenv("ALLOWED_ORIGIN", "*")
+ 
+	if apiKey == "" {
+		log.Println("WARNING: PULSE_API_KEY is not set; anyone can send metrics")
 	}
  
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -54,46 +60,52 @@ func main() {
 	defer pool.Close()
  
 	if err := pool.Ping(ctx); err != nil {
-		log.Fatalf("cannot reach database (check DATABASE_URL): %v", err)
+		log.Fatalf("cannot reach database: %v", err)
 	}
  
-	// Agents must send this key to write metrics. Refuse to start without one
-	// so the server is never accidentally deployed unlocked.
-	apiKey := os.Getenv("PULSE_API_KEY")
-	if apiKey == "" {
-		log.Fatal("PULSE_API_KEY is not set")
-	}
- 
-	s := &Server{db: pool, apiKey: apiKey}
+	s := &Server{db: pool, apiKey: apiKey, allowedOrigin: allowedOrigin}
  
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /metrics", s.requireKey(s.handleIngest))
+	mux.HandleFunc("POST /metrics", s.handleIngest)
 	mux.HandleFunc("GET /metrics", s.handleQuery)
+	mux.HandleFunc("GET /healthz", s.handleHealth)
  
-	// Hosts like Render pick the port and pass it in PORT.
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
 	log.Printf("server listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
  
-// requireKey rejects requests that don't carry "Authorization: Bearer <PULSE_API_KEY>".
-func (s *Server) requireKey(next http.HandlerFunc) http.HandlerFunc {
-	want := []byte("Bearer " + s.apiKey)
-	return func(w http.ResponseWriter, r *http.Request) {
-		got := []byte(r.Header.Get("Authorization"))
-		if subtle.ConstantTimeCompare(got, want) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next(w, r)
+// getenv returns the environment variable, or a fallback if it's not set.
+func getenv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
+	return fallback
+}
+ 
+// handleHealth lets the hosting platform check that the server is alive.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if err := s.db.Ping(r.Context()); err != nil {
+		http.Error(w, "database unreachable", http.StatusServiceUnavailable)
+		return
+	}
+	w.Write([]byte("ok"))
 }
  
 // handleIngest receives metrics from agents and stores them.
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
+	if s.apiKey != "" {
+		got := r.Header.Get("Authorization")
+		want := "Bearer " + s.apiKey
+		// Constant-time comparison so attackers can't guess the key by timing responses.
+		if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+ 
+	// Reject huge request bodies (1 MB max) so nobody can exhaust server memory.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+ 
 	var metrics []Metric
 	if err := json.NewDecoder(r.Body).Decode(&metrics); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -107,15 +119,21 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
  
-	for _, m := range metrics {
-		_, err := s.db.Exec(r.Context(),
-			`INSERT INTO metrics (host, name, value, ts) VALUES ($1, $2, $3, $4)`,
-			m.Host, m.Name, m.Value, time.Unix(m.Timestamp, 0))
-		if err != nil {
-			log.Printf("insert failed: %v", err)
-			http.Error(w, "database error", http.StatusInternalServerError)
-			return
-		}
+	// Write the whole batch in one round trip using Postgres COPY,
+	// instead of one INSERT (and one transaction) per metric.
+	rows := make([][]any, len(metrics))
+	for i, m := range metrics {
+		rows[i] = []any{m.Host, m.Name, m.Value, time.Unix(m.Timestamp, 0)}
+	}
+ 
+	_, err := s.db.CopyFrom(r.Context(),
+		pgx.Identifier{"metrics"},
+		[]string{"host", "name", "value", "ts"},
+		pgx.CopyFromRows(rows))
+	if err != nil {
+		log.Printf("batch insert failed: %v", err)
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
 	}
  
 	w.WriteHeader(http.StatusAccepted)
@@ -124,8 +142,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 // handleQuery returns stored metrics for one host and metric name over a time window.
 // Example: GET /metrics?host=my-laptop&name=cpu.percent&since=1h
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
-	// Allow the dashboard (running on a different port/domain) to call this endpoint.
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Origin", s.allowedOrigin)
  
 	q := r.URL.Query()
 	host := q.Get("host")
@@ -177,3 +194,4 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(QueryResponse{Host: host, Name: name, Points: points})
 }
+ 
