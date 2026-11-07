@@ -95,6 +95,34 @@ func TestCUSUMDetectsSustainedShiftInBothDirections(t *testing.T) {
 	}
 }
 
+func TestCUSUMResetsEvidenceAfterSignal(t *testing.T) {
+	detector, err := NewCUSUM(2, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []float64{9, 11} {
+		if _, err := detector.Observe(value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := detector.Observe(12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Alert {
+		t.Fatalf("expected a signal, got %+v", result)
+	}
+
+	result, err = detector.Observe(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Alert || result.Score != 0 {
+		t.Fatalf("expected accumulated evidence to reset after signal, got %+v", result)
+	}
+}
+
 func TestDetectorsRejectNonFiniteValuesWithoutChangingState(t *testing.T) {
 	newDetectors := []func() (Detector, error){
 		func() (Detector, error) { return NewRollingZScore(3, 3) },

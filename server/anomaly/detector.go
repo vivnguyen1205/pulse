@@ -25,7 +25,8 @@
 // standard deviations, ignored on each point; a larger allowance is less
 // sensitive to small shifts. The decision interval is the accumulated
 // evidence required to flag an anomaly; a larger interval reduces false
-// alarms but increases detection delay.
+// alarms but increases detection delay. After a signal, its accumulated
+// evidence resets so a continuing issue can produce a new signal later.
 //
 // Scores are detector-specific: RollingZScore reports absolute z-score,
 // EWMA reports distance from the baseline mean as a fraction of its current
@@ -205,7 +206,8 @@ func NewCUSUM(baselineSize int, allowance, interval float64) (*CUSUM, error) {
 }
 
 // Observe accumulates standardized evidence above and below the baseline.
-// The first baselineSize points establish the baseline.
+// The first baselineSize points establish the baseline. A signal resets both
+// cumulative sums before the next point is evaluated.
 func (d *CUSUM) Observe(value float64) (Observation, error) {
 	if err := validateValue(value); err != nil {
 		return Observation{}, err
@@ -224,7 +226,12 @@ func (d *CUSUM) Observe(value float64) (Observation, error) {
 	d.upper = nonnegativeSaturating(d.upper + z - d.allowance)
 	d.lower = nonnegativeSaturating(d.lower - z - d.allowance)
 	score := math.Max(d.upper, d.lower)
-	return Observation{Alert: score > d.interval, Score: score}, nil
+	alert := score > d.interval
+	if alert {
+		d.upper = 0
+		d.lower = 0
+	}
+	return Observation{Alert: alert, Score: score}, nil
 }
 
 // Reset discards the baseline and both cumulative sums.
