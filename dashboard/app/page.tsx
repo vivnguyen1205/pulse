@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import MetricChart, { type Point } from "./MetricChart";
+import type { AlertEpisode } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_PULSE_API ?? "http://localhost:8080";
 const REFRESH_MS = 5000;
@@ -12,6 +13,8 @@ export default function Home() {
   const [range, setRange] = useState("15m");
   const [cpu, setCpu] = useState<Point[]>([]);
   const [mem, setMem] = useState<Point[]>([]);
+  const [cpuAlerts, setCpuAlerts] = useState<AlertEpisode[]>([]);
+  const [memAlerts, setMemAlerts] = useState<AlertEpisode[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
@@ -29,15 +32,28 @@ export default function Home() {
       return data.points;
     }
 
+    async function fetchAlerts(name: string): Promise<AlertEpisode[]> {
+      const params = new URLSearchParams({ host, name, since: range, limit: "500" });
+      const res = await fetch(`${API_URL}/alerts?${params}`);
+      if (!res.ok) {
+        throw new Error(`${res.status}: ${await res.text()}`);
+      }
+      return res.json();
+    }
+
     async function load() {
       try {
-        const [cpuPoints, memPoints] = await Promise.all([
+        const [cpuPoints, memPoints, cpuEpisodes, memEpisodes] = await Promise.all([
           fetchMetric("cpu.percent"),
           fetchMetric("mem.percent"),
+          fetchAlerts("cpu.percent"),
+          fetchAlerts("mem.percent"),
         ]);
         if (cancelled) return;
         setCpu(cpuPoints);
         setMem(memPoints);
+        setCpuAlerts(cpuEpisodes);
+        setMemAlerts(memEpisodes);
         setError(null);
         setLastUpdated(new Date());
       } catch (e) {
@@ -76,7 +92,7 @@ export default function Home() {
               className="mt-1 rounded-md border border-zinc-300 bg-transparent px-3 py-1.5 dark:border-zinc-700"
               value={host}
               onChange={(e) => setHost(e.target.value)}
-              placeholder="my-laptop.local"
+              placeholder="pulse-demo-host-1"
             />
           </label>
           <label className="flex flex-col text-sm">
@@ -109,8 +125,20 @@ export default function Home() {
       )}
 
       <div className="grid gap-6 md:grid-cols-2">
-        <MetricChart title="CPU usage" points={cpu} color="#3b82f6" />
-        <MetricChart title="Memory usage" points={mem} color="#10b981" />
+        <MetricChart
+          title="CPU usage"
+          points={cpu}
+          color="#3b82f6"
+          alerts={cpuAlerts}
+          now={lastUpdated ? Math.floor(lastUpdated.getTime() / 1000) : 0}
+        />
+        <MetricChart
+          title="Memory usage"
+          points={mem}
+          color="#10b981"
+          alerts={memAlerts}
+          now={lastUpdated ? Math.floor(lastUpdated.getTime() / 1000) : 0}
+        />
       </div>
     </main>
   );

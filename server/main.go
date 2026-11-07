@@ -58,6 +58,16 @@ type Server struct {
 }
 
 func main() {
+	if len(os.Args) > 1 {
+		if os.Args[1] != "demo-seed" || len(os.Args) != 2 {
+			log.Fatal("usage: go run . [demo-seed]")
+		}
+		if err := runDemoSeed(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	dbURL := getenv("DATABASE_URL", "postgres://pulse:pulse@localhost:5432/pulse")
 	port := getenv("PORT", "8080") // hosting platforms set PORT for you
 	apiKey := os.Getenv("PULSE_API_KEY")
@@ -193,7 +203,7 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.Query(r.Context(),
 		`SELECT id, host, name, detector, started_at, ended_at, peak_value, peak_score
 		 FROM alert_episodes
-		 WHERE started_at >= $1
+		 WHERE (started_at >= $1 OR ended_at IS NULL OR ended_at >= $1)
 		   AND ($2 = '' OR host = $2)
 		   AND ($3 = '' OR name = $3)
 		 ORDER BY started_at DESC

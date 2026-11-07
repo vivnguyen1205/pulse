@@ -143,7 +143,8 @@ func (s *Server) loadReadyRollups(ctx context.Context, tx pgx.Tx, cutoff time.Ti
 	latestEligibleBucket := floorBucket(cutoff.Add(-rollupLatenessGrace).Add(-rollupInterval))
 	oldestBucket := latestEligibleBucket.Add(-time.Duration(s.alertConfig.baselinePoints) * rollupInterval)
 	rows, err := tx.Query(ctx,
-		`WITH ready AS (
+		`SELECT ready.host, ready.name, ready.bucket_ts
+		 FROM (
 		   SELECT m.host, m.name,
 		          date_bin('5 minutes', m.ts, TIMESTAMPTZ '2000-01-01 00:00:00+00') AS bucket_ts
 		   FROM metrics m
@@ -158,12 +159,7 @@ func (s *Server) loadReadyRollups(ctx context.Context, tx pgx.Tx, cutoff time.Ti
 		   GROUP BY m.host, m.name, bucket_ts
 		   ORDER BY bucket_ts, m.host, m.name
 		   LIMIT $3
-		 )
-		 SELECT ready.host, ready.name, ready.bucket_ts, AVG(m.value), COUNT(*)
-		 FROM ready
-		 JOIN metrics m ON m.host = ready.host AND m.name = ready.name
-		   AND m.ts >= ready.bucket_ts AND m.ts < ready.bucket_ts + INTERVAL '5 minutes'
-		 GROUP BY ready.host, ready.name, ready.bucket_ts
+		 ) ready
 		 ORDER BY ready.bucket_ts, ready.host, ready.name`,
 		cutoff.Add(-rollupLatenessGrace), oldestBucket, rollupBatchSize)
 	if err != nil {
@@ -171,17 +167,58 @@ func (s *Server) loadReadyRollups(ctx context.Context, tx pgx.Tx, cutoff time.Ti
 	}
 	defer rows.Close()
 
-	var rollups []metricRollup
+	var buckets []metricRollup
+	for rows.Next() {
+		var bucket metricRollup
+		if err := rows.Scan(&bucket.key.host, &bucket.key.name, &bucket.bucket); err != nil {
+			return nil, fmt.Errorf("scanning ready metric bucket: %w", err)
+		}
+		buckets = append(buckets, bucket)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading ready metric buckets: %w", err)
+	}
+	return aggregateMetricBuckets(ctx, tx, buckets)
+}
+
+func aggregateMetricBuckets(ctx context.Context, tx pgx.Tx, buckets []metricRollup) ([]metricRollup, error) {
+	if len(buckets) == 0 {
+		return nil, nil
+	}
+
+	hosts := make([]string, len(buckets))
+	names := make([]string, len(buckets))
+	timestamps := make([]time.Time, len(buckets))
+	for i, bucket := range buckets {
+		hosts[i] = bucket.key.host
+		names[i] = bucket.key.name
+		timestamps[i] = bucket.bucket
+	}
+
+	rows, err := tx.Query(ctx,
+		`SELECT b.host, b.name, b.bucket_ts, AVG(m.value), COUNT(*)
+		 FROM unnest($1::text[], $2::text[], $3::timestamptz[]) AS b(host, name, bucket_ts)
+		 JOIN metrics m ON m.host = b.host AND m.name = b.name
+		   AND m.ts >= b.bucket_ts AND m.ts < b.bucket_ts + INTERVAL '5 minutes'
+		 GROUP BY b.host, b.name, b.bucket_ts
+		 ORDER BY b.bucket_ts, b.host, b.name`,
+		hosts, names, timestamps)
+	if err != nil {
+		return nil, fmt.Errorf("aggregating raw metrics into five-minute rollups: %w", err)
+	}
+	defer rows.Close()
+
+	rollups := make([]metricRollup, 0, len(buckets))
 	for rows.Next() {
 		var rollup metricRollup
 		if err := rows.Scan(&rollup.key.host, &rollup.key.name, &rollup.bucket,
 			&rollup.value, &rollup.pointCount); err != nil {
-			return nil, fmt.Errorf("scanning ready metric bucket: %w", err)
+			return nil, fmt.Errorf("scanning aggregated metric bucket: %w", err)
 		}
 		rollups = append(rollups, rollup)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("reading ready metric buckets: %w", err)
+		return nil, fmt.Errorf("reading aggregated metric buckets: %w", err)
 	}
 	return rollups, nil
 }
